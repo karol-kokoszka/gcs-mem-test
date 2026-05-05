@@ -493,33 +493,60 @@ Note: TCP congestion (slow throughput with ACKs flowing) does NOT itself kill TC
 - Upload time: ~1.6 seconds at 100 MiB/s
 - Re-upload cost if failed: ~1.6 seconds — negligible
 
-### Recommendation
+### Conclusion
 
-**The answer depends on architecture and compaction strategy:**
+**ChunkSize=16MB must stay. The fork's WithBuffer (memory pool) is still needed.**
 
-**Scylla Cloud on vnodes with STCS (current default):**
-- **ChunkSize=16MB is the safer choice.** STCS produces unbounded SSTables — a node with 1TB and 8 shards can have a single 125 GB SSTable (21-minute upload). The re-upload cost of failure is too high to ignore. Chunked mode's extra resilience (19s→48s) provides real value for these long-running uploads.
-- The fork (or equivalent buffer pool logic) remains useful to avoid allocation churn.
+#### Why ChunkSize=0 is not viable
 
-**Scylla Cloud on tablets (future/migration):**
-- **ChunkSize=0 becomes viable.** Tablets bound SSTable size to ~5 GB (50s upload at 100 MiB/s). A failed re-upload costs ~50 seconds — acceptable given the rarity of 19+ second network blackouts on GCP internal network.
-- Even with STCS on tablets, the risk is bounded.
+ChunkSize=0 disables resumable/chunked uploads entirely — the file is uploaded in a single HTTP request. Any network interruption longer than ~19s (TCP retransmit timeout) kills the upload and the **entire file must be re-uploaded from scratch**.
 
-**For LCS workloads (SSTables ≤ 160 MB):**
-- **Use ChunkSize=0.** The re-upload cost is negligible (~1.6s). Memory savings, reduced latency, and dependency simplification clearly win.
+With Scylla Cloud's current defaults:
+- **STCS on vnodes** (confirmed default — no `default_compaction_strategy` exists in `scylla.yaml`): unbounded SSTables, realistically up to 64 GB per shard
+- **No network isolation**: agent shares NIC with Scylla; effective bandwidth can drop to 10-20 MiB/s during streaming operations
+- **64 GB at 10 MiB/s = ~109 minutes upload time**: a single TCP stall at minute 108 means starting over
 
-**For ICS workloads (Enterprise, SSTables ≤ 1 GB):**
-- **ChunkSize=0 is safe.** Re-upload cost of 1 GB is ~10 seconds. Acceptable.
+The re-upload cost is unacceptable. ChunkSize=16MB limits the blast radius to 16 MB (~1.6s) regardless of total file size.
 
-**Hybrid approach (best of both):**
-- SM could set ChunkSize per-upload based on file size: ChunkSize=0 for files < 1 GB, ChunkSize=16MB for files ≥ 1 GB. This would require a patch to the rclone GCS backend to make ChunkSize dynamic per-file rather than a static configuration.
-- Alternatively, accept ChunkSize=0 for all uploads and rely on rclone's `--retries` + SM's job-level retry for the rare failure of large STCS SSTables. The question is whether the backup SLA tolerates the potential re-upload cost.
+#### Why WithBuffer (memory pool) is still needed
 
-**Long-term:**
-- Upgrade rclone fork from v1.54.0 to a modern version (v1.73+)
-- Evaluate if the remaining 30 custom patches in the rclone fork are still needed
-- Consider upstream contributions for any patches that are generally useful
-- Once Scylla Cloud fully migrates to tablets, re-evaluate — ChunkSize=0 becomes safe for all workloads
+Even with ChunkSize=16MB, the upstream google-api-go-client allocates a fresh 16 MB `[]byte` buffer for each chunk upload and drops it for GC to collect. This is problematic:
+
+1. **GC is non-deterministic** — a dropped 16 MB buffer is not freed immediately. It becomes garbage that sits on the heap until the next GC cycle, which may not trigger for seconds or minutes.
+2. **Go's runtime doesn't eagerly return memory to the OS** — after GC marks pages free, it uses `MADV_FREE` (lazy reclaim). The RSS stays inflated.
+3. **Under cgroup pressure** (agent runs at MemoryHigh=4%, MemoryMax=5% of RAM), this "freed but not returned" memory counts against the limit and can trigger OOM or memory.high throttling.
+4. **Heap-in-use determines service memory footprint** — even if buffers are eventually collected, the service's reported heap usage (what the cgroup sees) includes all allocated-but-not-yet-collected objects.
+
+The fork's `WithBuffer` + `sync.Pool` ensures the same 16 MB buffer is reused across all chunk uploads: zero allocation, zero GC pressure, deterministic and minimal RSS.
+
+#### Why not invest in upstream rclone's resumable upload support
+
+The ideal solution would be proper GCS resumable upload support (resume from last byte offset, survive process restarts via session URI). However:
+- **Upstream rclone does NOT implement resumable uploads for GCS** — only Google Drive has ChunkSize-based resumable uploads
+- **There is no indication this is on rclone's roadmap** for the GCS backend
+- **We do not want to invest further in our rclone fork** — the goal is to minimize fork maintenance, not add features
+
+Therefore: the current approach (ChunkSize=16MB + WithBuffer pool) is the correct tradeoff. It provides adequate resilience without requiring new development.
+
+#### Note on GOMEMLIMIT
+
+Go 1.19+ provides `GOMEMLIMIT` (env var) or `runtime/debug.SetMemoryLimit()` — a soft memory limit that forces GC to run more aggressively as heap approaches the limit. This could theoretically help reclaim dropped buffers faster. However:
+- **Scylla Manager agent does NOT use GOMEMLIMIT** (verified — neither env var nor `SetMemoryLimit()` call exists in the codebase)
+- Even with `GOMEMLIMIT`, pooling is still superior: preventing allocation is always better than collecting it faster
+- `GOMEMLIMIT` is a complementary safeguard, not a replacement for buffer reuse
+
+#### Summary
+
+| Aspect | ChunkSize=0 | ChunkSize=16MB + WithBuffer |
+|--------|-------------|----------------------------|
+| Memory per upload | ~0 (stream) | 16 MB (pooled, reused) |
+| Failure blast radius | Entire file (up to 64 GB) | 16 MB |
+| Max survivable stall | ~19s | ~48s |
+| GC pressure | None | None (pooled) |
+| Fork dependency | Eliminated | Required |
+| Risk for STCS 64GB uploads | **Unacceptable** | Acceptable |
+
+**Decision: Keep ChunkSize=16MB and WithBuffer. The fork remains necessary.**
 
 ## Appendix: Test Programs
 
