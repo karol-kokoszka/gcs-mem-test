@@ -413,6 +413,7 @@ SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_up
 
 - Scylla Cloud runs **Scylla Enterprise** but does NOT explicitly set a compaction strategy on table creation (`~/dev/siren` — no compaction class in any CREATE TABLE statement)
 - Scylla Enterprise's default `class` is **STCS** (`SizeTieredCompactionStrategy`) — same as Open Source
+- **Confirmed**: there is no `default_compaction_strategy` setting in `scylla.yaml` (verified in `db/config.cc` source). The strategy is always per-table; if not specified at CREATE TABLE, the built-in default (STCS) applies.
 - ICS is *recommended* ("always choose ICS over STCS") but is NOT the default — users must opt in
 - **Therefore: Scylla Cloud customers on vnodes get STCS by default → unbounded SSTable sizes**
 - Backup bandwidth: `max_bandwidth: 100M` (100 MiB/s **per node**), configured in `config/files/include/default.yaml:695`. This is a single global value applied identically to AWS (S3) and GCP (GCS) — no cloud-specific overrides exist. Siren constructs per-DC rate limit strings (`"dc1:100"`, `"dc2:100"`) but the value is the same for all DCs. SM then assigns this limit to **every node individually** via `makeHostInfo` (`backup.go:47`), and each node's rclone agent enforces it independently (`worker_upload.go:228` → `RcloneMoveDir` → `BandwidthRate: "100M"`). If a DC has 3 nodes, aggregate DC bandwidth is 3 × 100 = 300 MiB/s, not 100 shared.
