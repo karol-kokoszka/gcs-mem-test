@@ -382,6 +382,31 @@ The concrete loss depends on SSTable file sizes, which vary by compaction strate
 | **TWCS** | All data in one time window / shards (could be **multiple GB**) | Seconds to minutes |
 | **ICS** (Enterprise) | ~1 GB per file | ~10 seconds |
 
+**Realistic STCS SSTable distribution (1 TB node, 8 shards = 125 GB/shard):**
+
+STCS creates a tiered distribution: many small SSTables + few very large ones. With default `min_threshold=4` and ~256 MB flush size:
+
+| Tier | SSTable Size | Count | Upload Time (at 100 MiB/s per node) |
+|------|-------------|-------|-------------------------------------|
+| 4 | ~64 GB | 1 | **10.9 min** |
+| 3 | ~16 GB | 3 | **2.7 min** each |
+| 2 | ~4 GB | 2 | **41 s** each |
+| 1 | ~1 GB | 3 | **10 s** each |
+| 0 | ~256 MB | 3 | **2.6 s** each |
+| **Total** | | **~12 SSTables** | **~22 min total** |
+
+The largest SSTable (~64 GB) dominates backup time. During its ~11-minute upload, any TCP stall >19s kills the upload with ChunkSize=0 and requires re-uploading all 64 GB from scratch (~11 min wasted).
+
+**Upload times per strategy (per node, at 100 MiB/s):**
+
+| Strategy | Largest SSTable (realistic) | Upload Time (largest file) | Re-upload cost on failure |
+|----------|----------------------------|---------------------------|--------------------------|
+| **STCS** (1TB/8 shards) | ~64 GB | **~10.9 min** | ~10.9 min wasted |
+| **LCS** | ~160 MB | **~1.6 s** | ~1.6 s (negligible) |
+| **TWCS** (10GB/day, 1-day window, 8 shards) | ~1.25 GB | **~12.5 s** | ~12.5 s |
+| **TWCS** (100GB/day high-ingest) | ~12.5 GB | **~2.1 min** | ~2.1 min |
+| **ICS** (Enterprise) | ~1 GB | **~10 s** | ~10 s |
+
 SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_upload.go:228` uses `RcloneMoveDir` on the entire snapshot directory). Any large-file handling is delegated to rclone's backend.
 
 **Scylla Cloud defaults (vnodes):**
@@ -418,10 +443,10 @@ SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_up
 - **The probability of hitting a transient error scales with upload duration.** A 160MB upload (1.6s) has negligible exposure. A 50GB upload (8.5 min) or 125GB upload (21 min) has meaningfully more exposure to transient network issues, GCS 5xx responses, or HTTP/2 RST_STREAM events.
 
 **Worst case with ChunkSize=0 and STCS:**
-- Node with 1TB data, 8 shards → largest SSTable could be ~125 GB
-- Upload time: ~21 minutes at 100 MiB/s
-- If TCP stalls for >19s at minute 20: entire 125 GB must be re-uploaded
-- Re-upload cost: ~21 minutes of additional bandwidth and time
+- Node with 1TB data, 8 shards → largest SSTable realistically ~64 GB (theoretical max ~125 GB)
+- Upload time: **~10.9 minutes** at 100 MiB/s
+- If TCP stalls for >19s at minute 10: entire 64 GB must be re-uploaded
+- Re-upload cost: ~10.9 minutes of additional bandwidth and time
 - With chunked mode: only ~16MB (~160ms) re-upload needed
 
 **Worst case with ChunkSize=0 and LCS:**
