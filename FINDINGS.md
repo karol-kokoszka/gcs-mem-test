@@ -442,6 +442,44 @@ SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_up
 
 - **The probability of hitting a transient error scales with upload duration.** A 160MB upload (1.6s) has negligible exposure. A 50GB upload (8.5 min) or 125GB upload (21 min) has meaningfully more exposure to transient network issues, GCS 5xx responses, or HTTP/2 RST_STREAM events.
 
+#### Cgroup constraints and network contention make large uploads slower and riskier
+
+The SM Agent runs in `scylla-helper.slice` with severely constrained resources:
+
+| Resource | Agent | Scylla Server | Isolation |
+|----------|-------|---------------|-----------|
+| CPUWeight | 10 (very low) | Default ~100+ | Kernel (cgroup) |
+| IOWeight | 10 (very low) | Default ~100+ | Kernel (cgroup) |
+| Memory | 4-5% of RAM | ~90%+ | Kernel (cgroup) |
+| **Network** | **No isolation** | **No isolation** | **Application-level only** (rclone bwlimit) |
+
+**Network bandwidth is NOT isolated by cgroups.** The agent's configured `rate_limit: 100M` is an application-level cap (rclone token bucket), not a kernel guarantee. When Scylla is streaming between nodes (repair, bootstrap, decommission, tablet migration), it can consume most of the NIC bandwidth, reducing the agent's effective throughput to **10-20 MiB/s or less**.
+
+This dramatically increases upload times for large SSTables:
+
+| SSTable Size | Upload at 100 MiB/s | Upload at 20 MiB/s (Scylla streaming) | Upload at 10 MiB/s (heavy streaming) |
+|---|---|---|---|
+| **64 GB** (STCS largest) | 10.9 min | **54.6 min** | **109 min (~1.8 hrs)** |
+| **16 GB** (STCS tier 3) | 2.7 min | **13.6 min** | **27.3 min** |
+| 4 GB (STCS tier 2) | 41 s | 3.4 min | 6.8 min |
+| 1 GB (ICS / TWCS) | 10 s | 51 s | 1.7 min |
+| 160 MB (LCS) | 1.6 s | 8 s | 16 s |
+
+**A 64 GB SSTable upload that takes ~1 hour under network contention has enormously more exposure to a >19s TCP disruption than a 10-second LCS upload.** And this is a realistic scenario — Scylla repair or topology changes can saturate the NIC for hours.
+
+**Worst case with ChunkSize=0 and STCS under contention:**
+- 64 GB SSTable uploading at effective 10 MiB/s → ~1.8 hours
+- Connection dies at minute 100 (TCP stall >19s from network congestion spike)
+- Entire 64 GB must be re-uploaded from scratch → another ~1.8 hours wasted
+- Total: ~3.6 hours for one SSTable that should take ~11 minutes at full speed
+
+**Same scenario with ChunkSize=16MB:**
+- Connection dies at minute 100 → retries last 16 MB chunk on new connection
+- Re-upload cost: 16 MB at 10 MiB/s = ~1.6 seconds
+- Upload resumes from persisted offset, completes normally
+
+Note: TCP congestion (slow throughput with ACKs flowing) does NOT itself kill TCP connections — both modes survive it. The danger is when congestion causes **buffer overflow at NIC/switch level → packet drops → TCP retransmit timeout (~19s without any ACK)**. This is more plausible during heavy Scylla streaming than during quiet periods.
+
 **Worst case with ChunkSize=0 and STCS:**
 - Node with 1TB data, 8 shards → largest SSTable realistically ~64 GB (theoretical max ~125 GB)
 - Upload time: **~10.9 minutes** at 100 MiB/s
