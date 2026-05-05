@@ -371,16 +371,54 @@ SM backup tasks upload hundreds of SSTables (one per table snapshot). At `Transf
 
 #### What you lose with ChunkSize=0
 
-The only concrete loss: ~29 seconds of extra resilience in the narrow window between 19s and 48s of network blackout. If TCP gets no response for 19-48 seconds, chunked mode can retry on a new connection while ChunkSize=0 has already failed. Beyond 48s, both modes fail.
+The concrete loss depends on SSTable file sizes, which vary by compaction strategy:
 
-In practice: if a GCE→GCS network blackout exceeds 19 seconds (an extraordinary event on Google's internal network), one in-flight SSTable upload fails and rclone retries by re-uploading the file from byte 0. The cost: re-uploading one SSTable (160-500MB) at 100 MiB/s = 1.6-5 seconds of additional bandwidth. SM's higher-level retry and checksum-based skip ensure no data is lost and no duplicate work is done for already-completed files.
+**Scylla compaction strategies and pessimistic SSTable sizes:**
+
+| Strategy | Pessimistic Max SSTable (per shard) | Typical Upload Time (at 100 MiB/s) |
+|----------|-------------------------------------|-------------------------------------|
+| **STCS** | Unbounded (total shard data — could be **tens/hundreds of GB**) | Minutes to tens of minutes |
+| **LCS** | ~160 MB (or size of largest partition) | ~1.6 seconds |
+| **TWCS** | All data in one time window / shards (could be **multiple GB**) | Seconds to minutes |
+| **ICS** (Enterprise) | ~1 GB per file | ~10 seconds |
+
+SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_upload.go:228` uses `RcloneMoveDir` on the entire snapshot directory). Any large-file handling is delegated to rclone's backend.
+
+**Impact on the ChunkSize=0 tradeoff:**
+
+- **LCS (160 MB SSTables):** If an upload fails at the ~19s TCP timeout, re-uploading 160MB from scratch costs ~1.6s of bandwidth. **Negligible.** ChunkSize=0 is safe.
+
+- **STCS/TWCS (multi-GB SSTables):** If a 50 GB SSTable upload fails after 8 minutes (at minute 8 of a ~8.5 min upload), ChunkSize=0 must re-upload all 50 GB from scratch (~8.5 min wasted). With chunked mode, only the last 16MB chunk (~160ms) is retried. **This is significant.**
+
+- **The probability of hitting a transient error scales with upload duration.** A 160MB upload (1.6s) has negligible exposure. A 50GB upload (8.5 min) or 125GB upload (21 min) has meaningfully more exposure to transient network issues, GCS 5xx responses, or HTTP/2 RST_STREAM events.
+
+**Worst case with ChunkSize=0 and STCS:**
+- Node with 1TB data, 8 shards → largest SSTable could be ~125 GB
+- Upload time: ~21 minutes at 100 MiB/s
+- If TCP stalls for >19s at minute 20: entire 125 GB must be re-uploaded
+- Re-upload cost: ~21 minutes of additional bandwidth and time
+- With chunked mode: only ~16MB (~160ms) re-upload needed
+
+**Worst case with ChunkSize=0 and LCS:**
+- Largest SSTable: ~160 MB
+- Upload time: ~1.6 seconds at 100 MiB/s
+- Re-upload cost if failed: ~1.6 seconds — negligible
 
 ### Recommendation
 
-**Short-term** (minimal change):
-- Set `ChunkSize=0` in rclone's GCS backend configuration (via SM's `chunk_size` option, which was added by the SM rclone fork)
-- Remove the `google.golang.org/api => github.com/scylladb/google-api-go-client` replace directive from SM's `go.mod`
-- This unblocks upgrading `google.golang.org/api` to current versions
+**The answer depends on which compaction strategies are used:**
+
+**For LCS workloads (SSTables ≤ 160 MB):**
+- **Use ChunkSize=0.** The re-upload cost of a failed 160MB file is negligible (~1.6s). The memory savings, reduced latency, and dependency simplification far outweigh the marginal resilience loss.
+- Remove the `google.golang.org/api => github.com/scylladb/google-api-go-client` replace directive from SM's `go.mod`.
+
+**For STCS/TWCS workloads (SSTables potentially multi-GB):**
+- **ChunkSize=16MB is justified** for tables with large SSTables. The re-upload cost of a failed 50-125GB upload is significant (minutes to tens of minutes), and chunked mode's extra ~29s of resilience (19s→48s) provides real value over long-running uploads.
+- The fork (or equivalent buffer pool logic) remains useful to avoid allocation churn for these large uploads.
+
+**Hybrid approach (best of both):**
+- SM could set ChunkSize per-upload based on file size: ChunkSize=0 for files < 1 GB, ChunkSize=16MB for files ≥ 1 GB. This would require a patch to the rclone GCS backend to make ChunkSize dynamic per-file rather than a static configuration.
+- Alternatively, accept ChunkSize=0 for all uploads and rely on rclone's `--retries` + SM's job-level retry for the rare failure of large STCS SSTables. The question is whether the backup SLA tolerates the potential re-upload cost.
 
 **Long-term:**
 - Upgrade rclone fork from v1.54.0 to a modern version (v1.73+)
