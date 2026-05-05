@@ -1,0 +1,12 @@
+# Test data files (large)
+1.txt
+big.txt
+
+# Compiled binaries
+googleapi
+
+# Temp logs
+*.log
+
+# OS files
+.DS_Store
