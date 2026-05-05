@@ -384,6 +384,31 @@ The concrete loss depends on SSTable file sizes, which vary by compaction strate
 
 SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_upload.go:228` uses `RcloneMoveDir` on the entire snapshot directory). Any large-file handling is delegated to rclone's backend.
 
+**Scylla Cloud defaults (vnodes):**
+
+- Scylla Cloud runs **Scylla Enterprise** but does NOT explicitly set a compaction strategy on table creation (`~/dev/siren` — no compaction class in any CREATE TABLE statement)
+- Scylla Enterprise's default `class` is **STCS** (`SizeTieredCompactionStrategy`) — same as Open Source
+- ICS is *recommended* ("always choose ICS over STCS") but is NOT the default — users must opt in
+- **Therefore: Scylla Cloud customers on vnodes get STCS by default → unbounded SSTable sizes**
+- Backup bandwidth: `max_bandwidth: 100M` (100 MB/s per DC), configured in `config/files/include/default.yaml:695`, applied uniformly to all DCs
+
+**Tablets architecture (Scylla 6.0+) changes the picture:**
+
+- With tablets, SSTables are scoped to a single tablet (not the entire vnode range)
+- Default target tablet size: **~5 GB** (rule of thumb: total storage / (RF × 5 GB))
+- Tablets split automatically as data grows → SSTables get smaller, not larger
+- No SSTable rewrite needed on topology changes (tablet migration moves SSTables intact)
+- **Pessimistic SSTable size with tablets: ~5 GB** (bounded by tablet size) regardless of compaction strategy
+- Upload time for 5 GB at 100 MiB/s: ~50 seconds
+
+| Architecture | Compaction | Pessimistic Max SSTable | Upload Time (100 MiB/s) |
+|-------------|-----------|------------------------|------------------------|
+| **Vnodes + STCS** (Scylla Cloud default) | STCS | Unbounded (tens/hundreds of GB) | Minutes to tens of minutes |
+| **Vnodes + ICS** (Enterprise, opt-in) | ICS | ~1 GB per fragment | ~10 seconds |
+| **Vnodes + LCS** | LCS | ~160 MB | ~1.6 seconds |
+| **Tablets + STCS** | STCS | ~5 GB (tablet-bounded) | ~50 seconds |
+| **Tablets + ICS** | ICS | ~1 GB per fragment | ~10 seconds |
+
 **Impact on the ChunkSize=0 tradeoff:**
 
 - **LCS (160 MB SSTables):** If an upload fails at the ~19s TCP timeout, re-uploading 160MB from scratch costs ~1.6s of bandwidth. **Negligible.** ChunkSize=0 is safe.
@@ -406,15 +431,21 @@ SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_up
 
 ### Recommendation
 
-**The answer depends on which compaction strategies are used:**
+**The answer depends on architecture and compaction strategy:**
+
+**Scylla Cloud on vnodes with STCS (current default):**
+- **ChunkSize=16MB is the safer choice.** STCS produces unbounded SSTables — a node with 1TB and 8 shards can have a single 125 GB SSTable (21-minute upload). The re-upload cost of failure is too high to ignore. Chunked mode's extra resilience (19s→48s) provides real value for these long-running uploads.
+- The fork (or equivalent buffer pool logic) remains useful to avoid allocation churn.
+
+**Scylla Cloud on tablets (future/migration):**
+- **ChunkSize=0 becomes viable.** Tablets bound SSTable size to ~5 GB (50s upload at 100 MiB/s). A failed re-upload costs ~50 seconds — acceptable given the rarity of 19+ second network blackouts on GCP internal network.
+- Even with STCS on tablets, the risk is bounded.
 
 **For LCS workloads (SSTables ≤ 160 MB):**
-- **Use ChunkSize=0.** The re-upload cost of a failed 160MB file is negligible (~1.6s). The memory savings, reduced latency, and dependency simplification far outweigh the marginal resilience loss.
-- Remove the `google.golang.org/api => github.com/scylladb/google-api-go-client` replace directive from SM's `go.mod`.
+- **Use ChunkSize=0.** The re-upload cost is negligible (~1.6s). Memory savings, reduced latency, and dependency simplification clearly win.
 
-**For STCS/TWCS workloads (SSTables potentially multi-GB):**
-- **ChunkSize=16MB is justified** for tables with large SSTables. The re-upload cost of a failed 50-125GB upload is significant (minutes to tens of minutes), and chunked mode's extra ~29s of resilience (19s→48s) provides real value over long-running uploads.
-- The fork (or equivalent buffer pool logic) remains useful to avoid allocation churn for these large uploads.
+**For ICS workloads (Enterprise, SSTables ≤ 1 GB):**
+- **ChunkSize=0 is safe.** Re-upload cost of 1 GB is ~10 seconds. Acceptable.
 
 **Hybrid approach (best of both):**
 - SM could set ChunkSize per-upload based on file size: ChunkSize=0 for files < 1 GB, ChunkSize=16MB for files ≥ 1 GB. This would require a patch to the rclone GCS backend to make ChunkSize dynamic per-file rather than a static configuration.
@@ -424,6 +455,7 @@ SM uploads SSTables whole — no splitting at the SM or rclone level (`worker_up
 - Upgrade rclone fork from v1.54.0 to a modern version (v1.73+)
 - Evaluate if the remaining 30 custom patches in the rclone fork are still needed
 - Consider upstream contributions for any patches that are generally useful
+- Once Scylla Cloud fully migrates to tablets, re-evaluate — ChunkSize=0 becomes safe for all workloads
 
 ## Appendix: Test Programs
 
